@@ -68,9 +68,9 @@ func ConvertFixture(name string, fixture *Fixture) (*ConvertedTest, error) {
 // phase is the shared pre_run payloads (snapshot → start block, preRun may be
 // nil) followed by the fixture's own setupEngineNewPayloads (start block →
 // per-test pre-state). The fixture's engineNewPayloads (the benchmark block)
-// become the measured test step. Each payload still emits an
-// engine_newPayload + engine_forkchoiceUpdated pair, so the chain head
-// advances naturally and no separate forkchoice injection is needed.
+// become the measured test step. Each payload emits an engine_newPayload +
+// engine_forkchoiceUpdated pair, and the replay is preceded by one
+// forkchoiceUpdated that returns the head to the block the fixture starts from.
 func ConvertStatefulFixture(name string, fixture *Fixture, preRun *StatefulPreRun) (*ConvertedTest, error) {
 	if fixture == nil {
 		return nil, fmt.Errorf("fixture is nil")
@@ -97,6 +97,24 @@ func ConvertStatefulFixture(name string, fixture *Fixture, preRun *StatefulPreRu
 		GenesisHash:  fixture.SnapshotBlockHash,
 		PayloadCount: len(setupPayloads) + len(fixture.EngineNewPayloads),
 	}
+
+	// Nothing guarantees the client is sitting on the block this fixture replays
+	// from. Every fixture starts at the same anchor, but the previous test left
+	// the head wherever its last payload landed, and since the per-test pre-run
+	// replay is skipped once the baseline already carries that state, nothing
+	// puts it back. A newPayload whose parent is not the head then needs state
+	// the client may no longer hold, and is answered ACCEPTED rather than VALID
+	// — orphaning that payload and every one after it for the rest of the run.
+	//
+	// Sent unconditionally rather than only on a detected mismatch: when the
+	// head already matches, the client recognises it and returns VALID without
+	// doing any work, which is cheaper than tracking the head across tests.
+	anchorLine, err := buildAnchorForkchoiceCall(setupPayloads, fixture.EngineNewPayloads)
+	if err != nil {
+		return nil, fmt.Errorf("building anchor forkchoiceUpdated call: %w", err)
+	}
+
+	result.SetupLines = append(result.SetupLines, anchorLine)
 
 	for i, payload := range setupPayloads {
 		lines, err := convertPayload(payload, i+1)
@@ -217,12 +235,47 @@ func buildNewPayloadCall(payload *EngineNewPayload, id int) (string, error) {
 // ZeroHash is the zero hash used for forkchoice state.
 const ZeroHash = "0x0000000000000000000000000000000000000000000000000000000000000000"
 
-// buildForkchoiceUpdatedCall builds an engine_forkchoiceUpdatedVX JSON-RPC call.
-func buildForkchoiceUpdatedCall(payload *EngineNewPayload, id int) (string, error) {
-	// Use the forkchoiceUpdated version from the fixture.
-	method := fmt.Sprintf("engine_forkchoiceUpdatedV%d", payload.ForkchoiceUpdatedVersion)
+// buildAnchorForkchoiceCall builds the forkchoiceUpdated that returns the chain
+// head to the block this fixture replays from: the parent of its first payload.
+// Taking it from the payload rather than from the fixture's startBlockHash keeps
+// it correct when a pre_run is prepended, where the first payload descends from
+// the snapshot block instead.
+func buildAnchorForkchoiceCall(setupPayloads, benchmarkPayloads []*EngineNewPayload) (string, error) {
+	payloads := setupPayloads
+	if len(payloads) == 0 {
+		payloads = benchmarkPayloads
+	}
 
-	blockHash := payload.ExecutionPayload.BlockHash
+	if len(payloads) == 0 || payloads[0].ExecutionPayload == nil {
+		return "", fmt.Errorf("no payload to derive the anchor from")
+	}
+
+	anchor := payloads[0].ExecutionPayload.ParentHash
+	if anchor == "" {
+		return "", fmt.Errorf("first payload has no parentHash")
+	}
+
+	// id 0 keeps the payload calls numbered from 1 as before.
+	return buildForkchoiceUpdatedCallForHash(anchor, payloads[0].ForkchoiceUpdatedVersion, 0)
+}
+
+// buildForkchoiceUpdatedCall builds an engine_forkchoiceUpdatedVX JSON-RPC call
+// setting the head to the payload's own block.
+func buildForkchoiceUpdatedCall(payload *EngineNewPayload, id int) (string, error) {
+	return buildForkchoiceUpdatedCallForHash(
+		payload.ExecutionPayload.BlockHash, payload.ForkchoiceUpdatedVersion, id)
+}
+
+// buildForkchoiceUpdatedCallForHash builds an engine_forkchoiceUpdatedVX call
+// setting the head to blockHash.
+//
+// safeBlockHash and finalizedBlockHash stay zero. That is load-bearing for the
+// anchor call: a client that has finalized a block at or above the anchor is
+// entitled to answer a forkchoiceUpdated pointing below it with VALID while
+// leaving the head where it is, which would look like a successful rewind and
+// fail on the next newPayload instead.
+func buildForkchoiceUpdatedCallForHash(blockHash string, version, id int) (string, error) {
+	method := fmt.Sprintf("engine_forkchoiceUpdatedV%d", version)
 
 	forkchoiceState := map[string]string{
 		"headBlockHash":      blockHash,
